@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.parse
 
@@ -35,6 +36,12 @@ if not AK or not SK:
 # CodeArts 目标端点（从抓包确认）
 BASE_URL = "https://snap-access.cn-north-4.myhuaweicloud.com"
 TARGET = BASE_URL + "/api/v2/chat/completions"
+
+# 上游 CodeArts 免费额度对同一账号的并发会话有硬上限（实测 3 个）。
+# 超限时上游直接返回“并发会话数已达上限”，因此这里主动排队，
+# 把打到上游的并发压到上限以内；排队超时则快速失败，交给 Bifrost 回退。
+MAX_UPSTREAM_CONCURRENCY = max(1, int(os.getenv("CODEARTS_MAX_CONCURRENCY", "3")))
+_UPSTREAM_SEM = threading.BoundedSemaphore(MAX_UPSTREAM_CONCURRENCY)
 HOST = "snap-access.cn-north-4.myhuaweicloud.com"
 AGENT_LIST_URL = BASE_URL + "/v1/agent-center/agents/useragents?offset=0&limit=100"
 AGENT_DETAIL_PATH = "/v1/agent-center/agents/detail"
@@ -533,6 +540,44 @@ def get_model(model_id):
     return jsonify(_model_payload(model_id))
 
 
+def _empty_completion_error():
+    """OpenAI 风格的错误体；Bifrost 会识别 error 字段并继续回退。"""
+    return {
+        "error": {
+            "message": "codearts upstream returned empty completion "
+                       "(content/reasoning/tool_calls all empty)",
+            "type": "upstream_empty_completion",
+            "code": "empty_completion",
+        }
+    }
+
+
+def _message_is_empty(message):
+    if not isinstance(message, dict):
+        return True
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return False
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return False
+    if message.get("tool_calls"):
+        return False
+    return True
+
+
+def _json_result_is_empty(result):
+    """非流式聚合结果是否为空补全（error 结果不算空，走原有 502 分支）。"""
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    for choice in result.get("choices") or []:
+        if not _message_is_empty(choice.get("message")):
+            return False
+        if not _message_is_empty(choice.get("delta")):
+            return False
+    return True
+
+
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def chat_completions():
     if request.method == "OPTIONS":
@@ -578,11 +623,35 @@ def chat_completions():
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
     headers = _hmac_headers(body, benefit=benefit, model_id=model)
 
+    # 主动限流：并发压到上游上限以内；拿不到名额就快速失败（503），
+    # 由 Bifrost 继续回退，而不是把上游的“并发已达上限”错误抛给用户。
+    if not _UPSTREAM_SEM.acquire(
+        timeout=float(os.getenv("CODEARTS_ACQUIRE_TIMEOUT", "30"))
+    ):
+        return (
+            _cors(
+                jsonify(
+                    {
+                        "error": {
+                            "message": "codearts upstream concurrency limit reached",
+                            "type": "rate_limit_error",
+                            "code": "concurrency_limit",
+                        }
+                    }
+                )
+            ),
+            503,
+        )
+    sem_state = {"held": True}
+
     try:
         upstream = requests.post(
             TARGET, data=body, headers=headers, stream=True, timeout=600
         )
     except Exception as e:
+        if sem_state["held"]:
+            _UPSTREAM_SEM.release()
+            sem_state["held"] = False
         return _cors(jsonify({"error": {"message": f"upstream error: {e}"}})), 502
 
     if upstream.status_code != 200:
@@ -590,6 +659,9 @@ def chat_completions():
             detail = upstream.text[:2000]
         except Exception:
             detail = ""
+        if sem_state["held"]:
+            _UPSTREAM_SEM.release()
+            sem_state["held"] = False
         return (
             _cors(
                 jsonify(
@@ -604,16 +676,23 @@ def chat_completions():
         )
 
     if want_stream:
-        def generate():
+        def _generate_inner():
             """严格转发为 OpenAI SSE；仅对 benefit 流补齐缺失的结束原因。"""
             content_type = (upstream.headers.get("Content-Type") or "").lower()
             is_benefit = model not in AGENT_MODELS
             saw_done = False
             saw_finish_reason = False
+            saw_payload = False
 
             # 上游偶尔会在请求 stream=true 时返回普通 JSON，包装成单个 SSE 帧。
             if "text/event-stream" not in content_type:
                 result = _parse_upstream_json(upstream)
+                if _json_result_is_empty(result):
+                    yield b"data: " + json.dumps(
+                        _empty_completion_error(), ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8") + b"\n\n"
+                    yield b"data: [DONE]\n\n"
+                    return
                 for choice in result.get("choices") or []:
                     if choice.get("finish_reason") in (None, "other"):
                         choice["finish_reason"] = "stop"
@@ -653,12 +732,32 @@ def chat_completions():
                         # 部分 Agent Runtime 只接受字符串 content，会将 null chunk
                         # 误判为无响应；OpenAI 兼容格式中空字符串表达同样语义。
                         delta = choice.get("delta")
-                        if isinstance(delta, dict) and delta.get("content") is None:
-                            delta["content"] = ""
+                        if isinstance(delta, dict):
+                            if delta.get("content") is None:
+                                delta["content"] = ""
+                            if (
+                                (isinstance(delta.get("content"), str) and delta["content"].strip())
+                                or (isinstance(delta.get("reasoning_content"), str) and delta["reasoning_content"].strip())
+                                or delta.get("tool_calls")
+                            ):
+                                saw_payload = True
+                        message_obj = choice.get("message")
+                        if isinstance(message_obj, dict) and not _message_is_empty(message_obj):
+                            saw_payload = True
                     payload = json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                     yield b"data: " + payload + b"\n\n"
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
+
+            # 上游返回了“空补全”（benefit 流常见 content:null 且无 reasoning/tool_calls）：
+            # 此时不能补 finish_reason:stop，否则客户端会收到一个 200 的空回复。
+            # 改发带 error 字段的 SSE 帧，Bifrost 会识别并继续回退/报错。
+            if not saw_payload:
+                yield b"data: " + json.dumps(
+                    _empty_completion_error(), ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8") + b"\n\n"
+                yield b"data: [DONE]\n\n"
+                return
 
             # 只对免费 benefit 模型补齐完全缺失的 finish_reason；不重发任何上游 chunk。
             if is_benefit and not saw_finish_reason:
@@ -681,6 +780,16 @@ def chat_completions():
             if not is_benefit and not saw_done:
                 yield b"data: [DONE]\n\n"
 
+        def generate():
+            """包一层：无论流式正常结束还是异常中断，都释放并发名额。"""
+            try:
+                for chunk in _generate_inner():
+                    yield chunk
+            finally:
+                if sem_state["held"]:
+                    _UPSTREAM_SEM.release()
+                    sem_state["held"] = False
+
         resp = Response(generate(), status=200, mimetype="text/event-stream")
         resp.headers["Cache-Control"] = "no-cache, no-transform"
         resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
@@ -691,9 +800,19 @@ def chat_completions():
     # CodeArts 在排队、重试或特定模型场景下可能即使请求 stream=false
     # 仍返回 text/event-stream；直接转发会导致客户端把 data: 当作 JSON 解析。
     result = _parse_upstream_json(upstream)
+    if sem_state["held"]:
+        _UPSTREAM_SEM.release()
+        sem_state["held"] = False
     if isinstance(result, dict) and result.get("error"):
         resp = Response(
             json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            status=502,
+            content_type="application/json; charset=utf-8",
+        )
+        return _cors(resp)
+    if _json_result_is_empty(result):
+        resp = Response(
+            json.dumps(_empty_completion_error(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             status=502,
             content_type="application/json; charset=utf-8",
         )
