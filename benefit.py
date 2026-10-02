@@ -4,10 +4,17 @@ CodeArts 免费额度签到/查询工具
 ==============================
 对应 IDE 里的免费模型福利机制（opengw.developer.huaweicloud.com，抓包确认）：
 
-    GET  /api/v1/benefit/claim        签到状态（返回上次签到时间）
-    POST /api/v1/benefit/claim        签到领取当日免费额度（空 body）
+    GET  /api/v1/benefit/claim        查询领取记录（result.create_time 为账号固定字段）
+    POST /api/v1/benefit/claim        领取当日免费额度（空 body，幂等）
     GET  /api/v1/user/tokens/balance  查询免费额度余额
     GET  /api/v1/gateway/config       免费模型列表
+
+重要语义（避免误读）：
+    * POST /benefit/claim 是幂等的：网关返回 error_code=0000 只代表“请求被受理”，
+      不代表当天真的发放了新额度；多次调用 result.create_time 保持不变，
+      因此不能用它判断“今天签到成功”。
+    * 真正反映可用额度的是 balance 接口：daily_token_limit / daily_tokens_used /
+      total_balance。当天额度用尽时 total_balance=0（按天重置）。
 
 用法（需先在 .env 配置 CODEARTS_AK / CODEARTS_SK）：
 
@@ -16,8 +23,8 @@ CodeArts 免费额度签到/查询工具
     python benefit.py claim      # 只签到
     python benefit.py models     # 查询免费模型列表
 
-配合 Windows 计划任务可实现每日自动签到，例如每天 09:05 执行：
-    schtasks /create /tn CodeArtsBenefit /tr "python C:\\...\\benefit.py claim" /sc daily /st 09:05
+配合 Windows 计划任务可实现每日自动签到（本机为每天 09:05 执行 benefit-claim.cmd）：
+    schtasks /create /tn CodeArtsBenefit /tr "E:\\ProgramData\\bifrost\\benefit-claim.cmd" /sc daily /st 09:05
 """
 import datetime
 import hashlib
@@ -26,6 +33,7 @@ import json
 import os
 import sys
 import urllib.parse
+import time
 
 import requests
 from dotenv import load_dotenv
@@ -75,9 +83,24 @@ def signed_request(method: str, url: str, body: bytes = b"") -> requests.Respons
     headers["Authorization"] = (
         f"SDK-HMAC-SHA256 Access={AK}, SignedHeaders={signed_headers}, Signature={signature}"
     )
-    return requests.request(
-        method.upper(), url, data=body or None, headers=headers, timeout=30
-    )
+    # 网络抖动重试：本工具所有请求都是幂等的（GET 查询 / POST claim 均可安全重试）。
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.request(
+                method.upper(), url, data=body or None, headers=headers, timeout=30
+            )
+            # 5xx 视为网关瞬时故障，重试；4xx 是确定性错误，直接返回交给 _unwrap 处理。
+            if response.status_code >= 500 and attempt < 2:
+                last_error = f"HTTP {response.status_code}"
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return response
+        except requests.RequestException as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"请求失败（已重试 3 次）: {last_error}")
 
 
 def _unwrap(response: requests.Response) -> dict:
@@ -91,7 +114,7 @@ def _unwrap(response: requests.Response) -> dict:
 
 
 def claim_status() -> dict:
-    """查询签到状态。create_time 即最近一次签到时间（毫秒时间戳）。"""
+    """查询领取记录。注意 result.create_time 是账号固定字段，并非最近一次签到时间。"""
     return _unwrap(signed_request("GET", CLAIM_URL))
 
 
@@ -133,7 +156,8 @@ def show_status() -> None:
 
 def do_claim() -> None:
     info = claim()
-    print(f"签到成功，最近签到时间: {_fmt_time(info.get('create_time'))}")
+    print("领取请求已受理（网关 error_code=0000；该接口幂等，不代表当日新增额度）")
+    print(f"领取记录 create_time: {_fmt_time(info.get('create_time'))}（账号固定字段，非本次签到时间）")
 
 
 def show_models() -> None:
